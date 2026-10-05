@@ -73,7 +73,7 @@ function sheetHtml(job, b) {
     <div class="meta">
       <div><span class="k">交接单号</span><span class="v">#${b.id}（本卷第 ${b.seq} 单）</span></div>
       <div><span class="k">方案</span><span class="v">#${job.id} ${esc(job.name)}</span></div>
-      <div><span class="k">卷号</span><span class="v">${esc(b.rollLabel)}（rollId=${b.rollId}）</span></div>
+      <div><span class="k">卷号</span><span class="v">${esc(b.rollLabel)}（rollId=${b.rollId}）${b.sourceRemnantId ? '　♻ 领入尾料卷 #' + b.sourceRemnantId : ''}</span></div>
       <div><span class="k">切线区间</span><span class="v">${b.previousCutLine} → ${b.cutLine} mm（本段 ${b.cutLine - b.previousCutLine}mm）</span></div>
       <div><span class="k">确认时间</span><span class="v">${esc(b.createdAt)}</span></div>
       <div><span class="k">本次新裁件</span><span class="v">${b.pieceCount} 件</span></div>

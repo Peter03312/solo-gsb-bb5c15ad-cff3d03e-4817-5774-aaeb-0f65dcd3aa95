@@ -17,6 +17,7 @@ let pieceRows = [];        // 新建表单：裁片卡片
 let cutInputRollId = null; // 切线输入框当前对应的卷（切换卷时重置建议值）
 let batchesData = null;    // 裁剪交接单（GET /api/jobs/:id/cut-batches 返回）
 const openBatches = new Set(); // 交接单面板中已展开明细的单号
+let remnantsData = null;   // 全局尾料列表（GET /api/remnants 返回）
 
 const PALETTE = [
   '#f4a261', '#2a9d8f', '#e9c46a', '#8ab17d', '#577590',
@@ -98,6 +99,7 @@ async function openJob(id) {
   fitScale();
   renderAll();
   refreshBatches();
+  refreshRemnants();
 }
 
 function currentRoll() {
@@ -127,6 +129,7 @@ function renderAll() {
   renderCutBar();
   renderCutPanel();
   renderBatchPanel();
+  renderRemnantPanel();
   renderUnplaced();
   renderSelPanel();
   renderRevPanel();
@@ -169,13 +172,20 @@ function renderRollTabs() {
   for (const r of state.rolls) {
     const tab = document.createElement('button');
     tab.className = 'rolltab' + (r.id === currentRollId ? ' active' : '');
+    let badge;
+    if (r.sealed) {
+      badge = `<span class="ulen">🧊 尾料已登记移交（切线 ${r.cutLine}mm 起，余 ${r.length - r.cutLine}mm，已冻结）</span>`;
+    } else if (r.sourceRemnantId) {
+      badge = `<span class="ulen">♻ 尾料卷 #${r.sourceRemnantId}${r.cutLine > 0 ? ` · ✂切线 ${r.cutLine}mm · 已裁 ${r.cutCount} 件` : ''}</span>`;
+    } else if (r.cutLine > 0) {
+      badge = `<span class="ulen">✂切线 ${r.cutLine}mm · 已裁 ${r.cutCount} 件</span>`;
+    } else if (r.used) {
+      badge = `<span class="ulen">占用 ${r.usedLength}mm</span>`;
+    } else {
+      badge = '<span class="idle">未启用</span>';
+    }
     tab.innerHTML =
-      `${r.seq}. ${r.label} <span class="dim">${r.width}×${r.length}mm</span>` +
-      (r.cutLine > 0
-        ? `<span class="ulen">✂切线 ${r.cutLine}mm · 已裁 ${r.cutCount} 件</span>`
-        : r.used
-          ? `<span class="ulen">占用 ${r.usedLength}mm</span>`
-          : '<span class="idle">未启用</span>');
+      `${r.seq}. ${r.label} <span class="dim">${r.width}×${r.length}mm</span>` + badge;
     tab.onclick = () => {
       currentRollId = r.id;
       fitScale();
@@ -194,17 +204,38 @@ function renderCutBar() {
   const r = currentRoll();
   if (!r) return;
   const info = $('cutInfo');
-  if (r.cutLine > 0) {
+  const input = $('cutLineInput');
+  const btnCut = $('btnConfirmCut');
+  const btnReg = $('btnRegisterRemnant');
+  const srcRem = r.sourceRemnantId
+    ? (state.remnants && state.remnants.incoming || []).find((m) => m.id === r.sourceRemnantId)
+    : null;
+  if (r.sealed) {
+    info.innerHTML =
+      `卷「${r.label}」已登记整幅尾料移交：原始区间 <b>${r.cutLine}~${r.length}mm</b>（余 ${r.length - r.cutLine}mm）已冻结，` +
+      `不能再排入裁片或推进切线`;
+  } else if (srcRem) {
+    info.innerHTML =
+      `卷「${r.label}」是<b>领入的尾料卷</b>（来源方案 #${srcRem.source.jobId} ${srcRem.source.jobName} · ` +
+      `卷「${srcRem.source.rollLabel}」原始区间 ${srcRem.startY}~${srcRem.endY}mm，以起点为零重算）：` +
+      (r.cutLine > 0
+        ? `切线 ${r.cutLine}/${r.length}mm，已裁 ${r.cutCount} 件，剩余 ${r.length - r.cutLine}mm`
+        : `卷长 ${r.length}mm，尚未裁剪`);
+  } else if (r.cutLine > 0) {
     info.textContent = `卷「${r.label}」：切线 ${r.cutLine}/${r.length}mm，已裁 ${r.cutCount} 件，剩余 ${r.length - r.cutLine}mm`;
   } else {
     info.textContent = `卷「${r.label}」尚未裁剪（卷长 ${r.length}mm）`;
   }
-  const input = $('cutLineInput');
+  // 冻结卷：裁剪与登记操作全部禁用
+  input.disabled = !!r.sealed;
+  btnCut.disabled = !!r.sealed;
+  btnReg.disabled = !!r.sealed;
+  btnReg.textContent = r.sealed ? '尾料已登记（已冻结）' : '登记整幅尾料移交';
   if (cutInputRollId !== r.id) {
     cutInputRollId = r.id;
     input.dataset.userEdit = '';
   }
-  if (input.dataset.userEdit !== '1') {
+  if (input.dataset.userEdit !== '1' && !r.sealed) {
     // 默认建议值：当前所有未裁已排件的末端（即“裁到本卷未裁占用末尾”）
     let suggest = 0;
     for (const p of state.placements) {
@@ -332,6 +363,100 @@ function renderBatchPanel() {
       if (openBatches.has(bid)) openBatches.delete(bid);
       else openBatches.add(bid);
       renderBatchPanel();
+    };
+  });
+}
+
+/* ================= 尾料移交（登记 / 浏览 / 跨方案领用） ================= */
+
+async function refreshRemnants() {
+  if (!state) {
+    remnantsData = null;
+    renderRemnantPanel();
+    return;
+  }
+  try {
+    remnantsData = await api('GET', '/api/remnants');
+  } catch (err) {
+    remnantsData = null;
+  }
+  renderRemnantPanel();
+}
+
+function defectText(m) {
+  if (!m.defects || m.defects.length === 0) return '无瑕疵';
+  return m.defects.map((d) => `(${d.x},${d.y}) ${d.w}×${d.h}`).join('、');
+}
+
+function remnantLine(m) {
+  const src =
+    `来源 #${m.source.jobId} ${m.source.jobName} / 卷「${m.source.rollLabel}」` +
+    ` 原始区间 ${m.startY}~${m.endY}mm`;
+  const tgt =
+    m.status === 'claimed' && m.target
+      ? ` → 已领用：#${m.target.jobId} ${m.target.jobName} / 卷「${m.target.rollLabel}」（${m.target.claimedAt}）`
+      : '';
+  return `<b>${m.status === 'claimed' ? '✅' : '🧊'} #${m.id} ${m.label}</b>：${m.width}×${m.length}mm；${src}${tgt}；瑕疵（以起点为零）：${defectText(m)}`;
+}
+
+function renderRemnantPanel() {
+  const el = $('remnantPanel');
+  if (!state) { el.className = ''; el.innerHTML = ''; return; }
+  const outgoing = (state.remnants && state.remnants.outgoing) || [];
+  const incoming = (state.remnants && state.remnants.incoming) || [];
+  const allGlobal = remnantsData ? remnantsData.remnants : [];
+  const available = allGlobal.filter((m) => m.status === 'available' && m.source.jobId !== state.job.id);
+  if (outgoing.length === 0 && incoming.length === 0 && available.length === 0) {
+    el.className = '';
+    el.innerHTML = '';
+    return;
+  }
+  el.className = 'show';
+  let html = '<div class="rm-head"><b>♻ 尾料移交（整幅尾料区间，可跨方案领用一次）</b></div>';
+
+  if (outgoing.length > 0) {
+    html += '<div class="rm-sec"><b>本方案已登记移交：</b></div>';
+    for (const m of outgoing) {
+      html += `<div class="rm-item ${m.status === 'claimed' ? 'claimed' : 'available'}">${remnantLine(m)}</div>`;
+    }
+  }
+  if (incoming.length > 0) {
+    html += '<div class="rm-sec"><b>本方案领入（作为独立卷参与移动/优化/裁剪）：</b></div>';
+    for (const m of incoming) {
+      html += `<div class="rm-item incoming">${remnantLine(m)}</div>`;
+    }
+  }
+  if (available.length > 0) {
+    html += `<div class="rm-sec"><b>其他方案可领用尾料（领入后成为本方案独立卷）：</b></div>`;
+    for (const m of available) {
+      html +=
+        `<div class="rm-item available">${remnantLine(m)} ` +
+        `<button class="mini rm-claim" data-rid="${m.id}">领用至本方案</button></div>`;
+    }
+  }
+  el.innerHTML = html;
+  el.querySelectorAll('.rm-claim').forEach((btn) => {
+    btn.onclick = async () => {
+      const rid = Number(btn.dataset.rid);
+      if (!window.confirm(
+        `将领用尾料 #${rid} 到本方案「${state.job.name}」？\n` +
+        `领入后成为本方案的独立卷，瑕疵坐标以来源区间起点为零重算；尾料只能领用一次，操作不可退回。`
+      )) return;
+      btn.disabled = true;
+      try {
+        const resp = await api('POST', `/api/remnants/${rid}/claim`, { targetJobId: state.job.id });
+        const c = resp.claim;
+        state = resp;
+        delete state.claim;
+        currentRollId = c.rollId;
+        fitScale();
+        renderAll();
+        await refreshRemnants();
+        showMsg(`已领入尾料 #${rid}：新卷「${c.label}」（${c.width}×${c.length}mm，瑕疵 ${c.defectCount} 个，已重算坐标）。`, false);
+      } catch (err) {
+        showApiError(err, '领用失败（可能已被他人领用），两方案均未变更');
+        btn.disabled = false;
+      }
     };
   });
 }
@@ -581,6 +706,36 @@ function draw() {
     }
     ctx.setLineDash([]);
   }
+  // 已登记移交的尾料区间 [cutLine, length)：青色冻结带
+  if (r.sealed && r.cutLine < L) {
+    ctx.fillStyle = 'rgba(0,121,107,0.16)';
+    ctx.fillRect(mmX(0), mmY(r.cutLine), W * scale, (L - r.cutLine) * scale);
+    ctx.strokeStyle = 'rgba(0,105,92,0.55)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([6, 5]);
+    ctx.beginPath();
+    ctx.moveTo(mmX(0), mmY(r.cutLine));
+    ctx.lineTo(mmX(W), mmY(r.cutLine));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#00695c';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`🧊 尾料已登记移交：${r.cutLine}~${L}mm（${L - r.cutLine}mm，已冻结）`, mmX(4), mmY(r.cutLine) + 16);
+  }
+  // 领入尾料卷：左上角标注来源追溯
+  if (r.sourceRemnantId) {
+    const m = ((state.remnants && state.remnants.incoming) || []).find((x) => x.id === r.sourceRemnantId);
+    if (m) {
+      ctx.fillStyle = '#00695c';
+      ctx.font = '11px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(
+        `♻ 领入尾料 #${m.id}：来源 #${m.source.jobId} ${m.source.jobName} /「${m.source.rollLabel}」区间 ${m.startY}~${m.endY}mm`,
+        mmX(0), mmY(0) - 24
+      );
+    }
+  }
 
   // 当前卷瑕疵区
   for (const d of defectsOf(r.id)) {
@@ -824,6 +979,44 @@ $('btnConfirmCut').onclick = async () => {
   }
 };
 
+$('btnRegisterRemnant').onclick = async () => {
+  if (!state) return;
+  const r = currentRoll();
+  if (!r) return;
+  if (r.sealed) {
+    showMsg(`卷「${r.label}」的尾料已登记移交并冻结。`, true);
+    return;
+  }
+  if (r.cutLine <= 0) {
+    showMsg('该卷尚未确认切线：请先确认切线（裁完当前段）后再登记整幅尾料。', true);
+    return;
+  }
+  const remain = r.length - r.cutLine;
+  if (remain <= 0) {
+    showMsg('切线已到卷末端，没有可移交的尾料。', true);
+    return;
+  }
+  if (!window.confirm(
+    `确认把卷「${r.label}」切线 ${r.cutLine}mm 之后的整幅区间（${remain}mm）登记为尾料并移交？\n` +
+    `登记后该卷立即冻结：不能再排入裁片，也不能推进切线；尾料可被其他方案领用一次。`
+  )) return;
+  try {
+    const resp = await api('POST', `/api/jobs/${state.job.id}/remnants`, { rollId: r.id });
+    const m = resp.remnant;
+    state = resp;
+    delete state.remnant;
+    renderAll();
+    await refreshRemnants();
+    showMsg(
+      `已登记尾料 #${m.id}：卷「${r.label}」区间 ${m.startY}~${m.endY}mm（${m.length}mm）已冻结，` +
+      `跨起点瑕疵已按起点重算（${m.defectCount} 个带入）。可在下方尾料面板查看，或由其他方案领用。`,
+      false
+    );
+  } catch (err) {
+    showApiError(err, '尾料登记被拒绝，原方案不变');
+  }
+};
+
 $('btnApplyMove').onclick = async () => {
   const p = findPlacement(selectedId);
   if (!p) return;
@@ -900,6 +1093,7 @@ $('btnDeleteJob').onclick = async () => {
   selectedId = null;
   currentRollId = null;
   batchesData = null;
+  remnantsData = null;
   openBatches.clear();
   await refreshJobList();
   renderAll();

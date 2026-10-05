@@ -1469,6 +1469,283 @@ test('API：删除方案级联删除其交接单', () =>
   })
 );
 
+// ---------------- 尾料移交（登记整幅尾料区间；跨方案领用一次） ----------------
+
+console.log('尾料移交 API');
+
+/** 创建方案→优化→切线，返回 { jobId, rollId } */
+async function setupCutRoll(call, body, cutLine) {
+  const cr = await call('POST', '/api/jobs', body);
+  assert.strictEqual(cr.status, 201, JSON.stringify(cr.data));
+  const jobId = cr.data.job.id;
+  const rollId = cr.data.rolls[0].id;
+  const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+  assert.strictEqual(op.data.unplaced.length, 0, op.data.unplaced.map((u) => u.reason).join('；'));
+  const r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId, cutLine });
+  assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+  return { jobId, rollId };
+}
+
+test('API：尾料登记——无切线/剩余为0/切线后有未裁件/重复登记均 409 且原状态不变', () =>
+  withServer(async (call) => {
+    // 无切线：优化后直接登记
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 300, length: 3000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 300, 300), quantity: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    const rid = cr.data.rolls[0].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    let r = await call('POST', `/api/jobs/${jobId}/remnants`, { rollId: rid });
+    assert.strictEqual(r.status, 409);
+    assert(/尚未确认过切线/.test(r.data.error));
+
+    // 切 300 后第二件在 y300~600：切线后有未裁排入件 → 409 且列出冲突件
+    await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: rid, cutLine: 300 });
+    r = await call('POST', `/api/jobs/${jobId}/remnants`, { rollId: rid });
+    assert.strictEqual(r.status, 409, JSON.stringify(r.data));
+    assert(/切线 .* 之后还有/.test(r.data.error));
+    assert(r.data.conflicts.length === 1 && /块#2/.test(r.data.conflicts[0]));
+
+    // 未登记成功：卷未冻结，切线仍可推进
+    let st = await call('GET', `/api/jobs/${jobId}`);
+    assert.strictEqual(st.data.rolls[0].sealed, false);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: rid, cutLine: 600 })).status, 200);
+
+    // 登记成功
+    r = await call('POST', `/api/jobs/${jobId}/remnants`, { rollId: rid });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.data));
+    const remId = r.data.remnant.id;
+    assert.strictEqual(r.data.rolls[0].sealed, true);
+    assert.deepStrictEqual([r.data.remnant.startY, r.data.remnant.endY, r.data.remnant.length], [600, 3000, 2400]);
+
+    // 重复登记 409
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/remnants`, { rollId: rid })).status, 409);
+
+    // 剩余长度 0：两件恰好铺满 600 卷
+    const cr2 = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'B', width: 300, length: 600 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 300, 300), quantity: 2 }],
+    });
+    const j2 = cr2.data.job.id;
+    const r2 = cr2.data.rolls[0].id;
+    await call('POST', `/api/jobs/${j2}/optimize`);
+    await call('POST', `/api/jobs/${j2}/cuts`, { rollId: r2, cutLine: 600 });
+    const z = await call('POST', `/api/jobs/${j2}/remnants`, { rollId: r2 });
+    assert.strictEqual(z.status, 409);
+    assert(/剩余长度为 0/.test(z.data.error));
+
+    // 无效卷 400、目标方案不存在 404
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/remnants`, { rollId: 99999 })).status, 400);
+    assert.strictEqual((await call('POST', '/api/jobs/99999/remnants', { rollId: 1 })).status, 404);
+  })
+);
+
+test('API：登记后来源卷冻结——不能推切线/排入裁片/设必用卷，优化不再使用其尾料段', () =>
+  withServer(async (call) => {
+    const { jobId, rollId } = await setupCutRoll(call, {
+      rolls: [{ label: 'A', width: 1000, length: 4000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 2 }],
+    }, 400);
+    const reg = await call('POST', `/api/jobs/${jobId}/remnants`, { rollId });
+    assert.strictEqual(reg.status, 201);
+
+    // 推切线 409；移动未裁件（此处无未裁件，用改版新增件验证）——先测切线
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/cuts`, { rollId, cutLine: 800 })).status, 409);
+
+    // 改版扩增两件：优化时不得排进已冻结的 A 卷尾料段（单卷方案→未排）
+    const tid = (await call('GET', `/api/jobs/${jobId}`)).data.pieceTypes[0].id;
+    const rv = await call('POST', `/api/jobs/${jobId}/piece-types/${tid}/revisions`, {
+      vertices: rect(0, 0, 400, 400), quantity: 4,
+    });
+    assert.strictEqual(rv.status, 200, JSON.stringify(rv.data));
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    const newUnplaced = op.data.unplaced;
+    assert.strictEqual(newUnplaced.length, 2, '冻结卷尾料段不能再排入新增件');
+    assert(newUnplaced.every((u) => /找不到可行位置/.test(u.reason)));
+
+    // 未排件不能手动排入冻结卷
+    const pid = newUnplaced[0].id;
+    const mv = await call('POST', `/api/jobs/${jobId}/placements/${pid}/move`, { rollId, x: 0, y: 400, rotation: 0 });
+    assert.strictEqual(mv.status, 409);
+    assert(/已登记移交|冻结/.test(mv.data.error));
+    // 必用卷设为冻结卷 → 400
+    const rr = await call('POST', `/api/jobs/${jobId}/placements/${pid}/require-roll`, { rollId });
+    assert.strictEqual(rr.status, 400);
+    assert(/冻结/.test(rr.data.error));
+  })
+);
+
+test('API：跨起点瑕疵在领用时截断，尾料内瑕疵按起点重算，已裁段瑕疵不带入', () =>
+  withServer(async (call) => {
+    const { jobId, rollId, remnantId } = await new Promise(async (resolve) => {
+      const cr = await call('POST', '/api/jobs', {
+        rolls: [{ label: 'A', width: 1000, length: 4000, defects: [
+          { x: 10, y: 300, w: 100, h: 200 }, // 跨起点 400：截到 y0，高 100
+          { x: 20, y: 1200, w: 50, h: 50 }, // 尾料内：1200-400=800
+          { x: 30, y: 100, w: 50, h: 50 },   // 完全在已裁段：不带入
+          { x: 40, y: 400, w: 20, h: 20 },   // 边接触起点：整体复制 y0
+        ] }],
+        pieces: [{ name: '块', vertices: rect(0, 0, 200, 200), quantity: 1 }],
+      });
+      const jid = cr.data.job.id;
+      const rid0 = cr.data.rolls[0].id;
+      await call('POST', `/api/jobs/${jid}/optimize`);
+      await call('POST', `/api/jobs/${jid}/cuts`, { rollId: rid0, cutLine: 400 });
+      const reg = await call('POST', `/api/jobs/${jid}/remnants`, { rollId: rid0 });
+      resolve({ jobId: jid, rollId: rid0, remnantId: reg.data.remnant.id });
+    });
+
+    const one = await call('GET', `/api/remnants/${remnantId}`);
+    assert.strictEqual(one.status, 200);
+    const ds = one.data.remnant.defects;
+    assert.strictEqual(ds.length, 3, '应带入 3 个瑕疵（跨起点/尾料内/边接触）');
+    assert.deepStrictEqual(ds.find((d) => d.x === 10), { x: 10, y: 0, w: 100, h: 100 }, '跨起点瑕疵裁截到起点');
+    assert.deepStrictEqual(ds.find((d) => d.x === 20), { x: 20, y: 800, w: 50, h: 50 }, '尾料内瑕疵重算');
+    assert.deepStrictEqual(ds.find((d) => d.x === 40), { x: 40, y: 0, w: 20, h: 20 }, '边接触起点瑕疵整体复制');
+    assert(!ds.some((d) => d.x === 30), '已裁段瑕疵不带入');
+  })
+);
+
+test('API：领用尾料——目标方案新增独立卷参与优化/移动/裁剪，可追溯来源；只能领用一次', () =>
+  withServer(async (call) => {
+    // 来源：500 宽卷，瑕疵一个
+    const src = await setupCutRoll(call, {
+      rolls: [{ label: '旧卷', width: 500, length: 3000, defects: [{ x: 0, y: 2600, w: 100, h: 100 }] }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 400, 400), quantity: 1 }],
+    }, 400);
+    const reg = await call('POST', `/api/jobs/${src.jobId}/remnants`, { rollId: src.rollId });
+    assert.strictEqual(reg.status, 201);
+    const remId = reg.data.remnant.id;
+
+    // 目标方案：新卷 500 宽但 [0,300) 段有一条全宽瑕疵带，300 高的件在该卷无可行位置，
+    // 只能排入领入的尾料卷（来源 500 宽、余 2600 长）
+    const tcr = await call('POST', '/api/jobs', {
+      name: '目标',
+      rolls: [{ label: '新卷', width: 500, length: 5000, defects: [{ x: 0, y: 0, w: 500, h: 4701 }] }],
+      pieces: [{ name: '大片', vertices: rect(0, 0, 300, 300), quantity: 2 }],
+    });
+    const tgt = tcr.data.job.id;
+    const claim = await call('POST', `/api/remnants/${remId}/claim`, { targetJobId: tgt, label: '旧卷尾料' });
+    assert.strictEqual(claim.status, 201, JSON.stringify(claim.data));
+    const newRollId = claim.data.claim.rollId;
+    assert.strictEqual(claim.data.claim.length, 2600);
+    assert.strictEqual(claim.data.claim.defectCount, 1);
+    const newRoll = claim.data.rolls.find((r) => r.id === newRollId);
+    assert.strictEqual(newRoll.label, '旧卷尾料');
+    assert.strictEqual(newRoll.length, 2600);
+    assert.strictEqual(newRoll.sealed, false, '领入卷不是冻结卷');
+    assert.strictEqual(newRoll.sourceRemnantId, remId);
+    // 瑕疵以起点重算（2600-400=2200）
+    const nd = claim.data.defectsByRoll.find((d) => d.rollId === newRollId).defects[0];
+    assert.deepStrictEqual(nd, { id: nd.id, x: 0, y: 2200, w: 100, h: 100 });
+
+    // 300 宽件优化后排入领入尾料卷（新窄卷只有 200 宽）
+    const op = await call('POST', `/api/jobs/${tgt}/optimize`);
+    assert.strictEqual(op.data.unplaced.length, 0);
+    assert(op.data.placements.every((p) => p.rollId === newRollId));
+
+    // 领入卷可正常裁剪
+    const cut = await call('POST', `/api/jobs/${tgt}/cuts`, { rollId: newRollId, cutLine: 300 });
+    assert.strictEqual(cut.status, 200, JSON.stringify(cut.data));
+    assert.strictEqual(cut.data.cut.batchSeq, 1, '领入卷独立产生交接单');
+
+    // 追溯：来源记录 claimed；目标方案 incoming 含来源信息
+    const one = await call('GET', `/api/remnants/${remId}`);
+    assert.strictEqual(one.data.remnant.status, 'claimed');
+    assert.strictEqual(one.data.remnant.target.jobId, tgt);
+    assert.strictEqual(one.data.remnant.target.rollId, newRollId);
+    assert.strictEqual(one.data.remnant.source.jobId, src.jobId);
+    const tst = await call('GET', `/api/jobs/${tgt}`);
+    assert.strictEqual(tst.data.remnants.incoming.length, 1);
+    assert.strictEqual(tst.data.remnants.incoming[0].source.rollId, src.rollId);
+    assert.strictEqual(tst.data.remnants.incoming[0].startY, 400);
+    const sst = await call('GET', `/api/jobs/${src.jobId}`);
+    assert.strictEqual(sst.data.remnants.outgoing[0].status, 'claimed');
+
+    // 交接单记录领入卷来源
+    const batches = await call('GET', `/api/jobs/${tgt}/cut-batches`);
+    assert.strictEqual(batches.data.batches[0].sourceRemnantId, remId);
+
+    // 重复领用 409；目标不存在 404；卷号重名 409
+    assert.strictEqual((await call('POST', `/api/remnants/${remId}/claim`, { targetJobId: tgt })).status, 409);
+    assert.strictEqual((await call('POST', `/api/remnants/${remId}/claim`, { targetJobId: 99999 })).status, 404);
+    // 未领用过的尾料领回来源方案 → 400（只能跨方案）
+    const src2 = await setupCutRoll(call, {
+      rolls: [{ label: '另一卷', width: 500, length: 2000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 200, 200), quantity: 1 }],
+    }, 200);
+    const reg2 = await call('POST', `/api/jobs/${src2.jobId}/remnants`, { rollId: src2.rollId });
+    const selfClaim = await call('POST', `/api/remnants/${reg2.data.remnant.id}/claim`, { targetJobId: src2.jobId });
+    assert.strictEqual(selfClaim.status, 400);
+    assert(/跨方案/.test(selfClaim.error || selfClaim.data.error));
+    // 卷号重名：领入目标方案时复用已有卷号「旧卷尾料」→ 409
+    const dup = await call('POST', `/api/remnants/${reg2.data.remnant.id}/claim`, { targetJobId: tgt, label: '旧卷尾料' });
+    assert.strictEqual(dup.status, 409);
+    assert(/卷号/.test(dup.data.error));
+  })
+);
+
+test('API：并发领用同一尾料恰一个成功，两方案不产生部分变更', () =>
+  withServer(async (call) => {
+    const a = await setupCutRoll(call, {
+      rolls: [{ width: 500, length: 2000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 200, 200), quantity: 1 }],
+    }, 200);
+    const reg = await call('POST', `/api/jobs/${a.jobId}/remnants`, { rollId: a.rollId });
+    const remId = reg.data.remnant.id;
+    const t1 = (await call('POST', '/api/jobs', {
+      rolls: [{ width: 500, length: 2000 }],
+      pieces: [{ name: 'x', vertices: rect(0, 0, 10, 10), quantity: 1 }],
+    })).data.job.id;
+    const t2 = (await call('POST', '/api/jobs', {
+      rolls: [{ width: 500, length: 2000 }],
+      pieces: [{ name: 'x', vertices: rect(0, 0, 10, 10), quantity: 1 }],
+    })).data.job.id;
+    const [c1, c2] = await Promise.all([
+      call('POST', `/api/remnants/${remId}/claim`, { targetJobId: t1 }),
+      call('POST', `/api/remnants/${remId}/claim`, { targetJobId: t2 }),
+    ]);
+    const statuses = [c1.status, c2.status].sort();
+    assert.deepStrictEqual(statuses, [201, 409], `并发领用应恰一个成功：${statuses}`);
+    // 只有一个方案多了一卷；尾料只 claimed 一次
+    const n1 = (await call('GET', `/api/jobs/${t1}`)).data.rolls.length;
+    const n2 = (await call('GET', `/api/jobs/${t2}`)).data.rolls.length;
+    assert.strictEqual(n1 + n2, 3, '恰一个目标方案新增一卷');
+    const one = await call('GET', `/api/remnants/${remId}`);
+    assert.strictEqual(one.data.remnant.status, 'claimed');
+  })
+);
+
+test('API：尾料列表过滤与删除方案级联；领入来源方案删除后追溯字段置空但新卷保留', () =>
+  withServer(async (call) => {
+    const a = await setupCutRoll(call, {
+      name: '将删除', rolls: [{ label: 'A', width: 500, length: 2000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 200, 200), quantity: 1 }],
+    }, 200);
+    const reg = await call('POST', `/api/jobs/${a.jobId}/remnants`, { rollId: a.rollId });
+    const remId = reg.data.remnant.id;
+    const tgt = (await call('POST', '/api/jobs', {
+      rolls: [{ width: 500, length: 2000 }],
+      pieces: [{ name: 'x', vertices: rect(0, 0, 10, 10), quantity: 1 }],
+    })).data.job.id;
+    assert.strictEqual((await call('POST', `/api/remnants/${remId}/claim`, { targetJobId: tgt })).status, 201);
+
+    // 列表过滤
+    assert.strictEqual((await call('GET', '/api/remnants?status=available')).data.remnants.length, 0);
+    assert.strictEqual((await call('GET', '/api/remnants?status=claimed')).data.remnants.length, 1);
+    assert.strictEqual((await call('GET', '/api/remnants?status=bogus')).status, 400);
+
+    // 删除来源方案：尾料登记随来源级联删除；目标方案的领入卷保留（source_remnant_id 置空）
+    assert.strictEqual((await call('DELETE', `/api/jobs/${a.jobId}`)).status, 204);
+    assert.strictEqual((await call('GET', `/api/remnants/${remId}`)).status, 404);
+    const tst = await call('GET', `/api/jobs/${tgt}`);
+    assert.strictEqual(tst.data.rolls.length, 2, '领入卷不随来源方案删除');
+    assert.strictEqual(tst.data.rolls.find((r) => r.seq === 2).sourceRemnantId, null);
+    assert.strictEqual(tst.data.remnants.incoming.length, 0);
+  })
+);
+
 runAll().then(() => {
   console.log(`\n${passed} 项测试${process.exitCode ? '，存在失败' : '全部通过'}。`);
 });

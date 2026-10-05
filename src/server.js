@@ -37,7 +37,23 @@ function loadFull(jobId) {
        WHERE p.job_id = ? ORDER BY p.id`
     )
     .all(jobId);
-  return { job, rolls, defects, types, revisions, placements };
+  const remnants = db
+    .prepare(
+      `SELECT m.*, r.label AS source_roll_label, r.width AS source_roll_width,
+              r.length AS source_roll_length, r.cut_line AS source_roll_cut_line,
+              j.name AS source_job_name,
+              tj.name AS target_job_name,
+              tr.label AS target_roll_label
+       FROM remnants m
+       JOIN rolls r ON r.id = m.source_roll_id
+       JOIN jobs j ON j.id = m.source_job_id
+       LEFT JOIN jobs tj ON tj.id = m.target_job_id
+       LEFT JOIN rolls tr ON tr.id = m.target_roll_id
+       WHERE m.source_job_id = ? OR m.target_job_id = ?
+       ORDER BY m.id`
+    )
+    .all(jobId, jobId);
+  return { job, rolls, defects, types, revisions, placements, remnants };
 }
 
 /**
@@ -99,6 +115,8 @@ function jobState(jobId) {
     usedLength: r.used_length,
     cutLine: r.cut_line,               // 本卷切线（mm）：[0,cutLine) 已裁；0=尚未裁剪
     cutCount: cutCountByRoll.get(r.id) || 0,
+    sealed: !!r.sealed,                // 尾料已登记移交：已冻结，不得再排入裁片或推进切线
+    sourceRemnantId: r.source_remnant_id, // 非 null=本卷为其他方案尾料领入（值即尾料登记 id）
   }));
   const firstRoll = rolls[0] || null;
   return {
@@ -174,6 +192,8 @@ function jobState(jobId) {
       })),
     // 裁剪进度（按卷；未裁剪的卷 cutLine=0、cutPieces=[]，同样列出）
     cuts: cutSummary(rolls, placements),
+    // 尾料移交：outgoing=本方案登记移交出去的尾料；incoming=从其他方案领入形成的独立卷
+    remnants: remnantsForJob(full),
   };
 }
 
@@ -200,6 +220,87 @@ function cutSummary(rolls, placements) {
       }))
       .sort((a, b) => a.y - b.y || a.id - b.id),
   }));
+}
+
+// ---------- 尾料移交辅助 ----------
+
+/**
+ * 来源卷尾料区间 [startY, endY) 内的瑕疵，按“区间起点为零”重算到目标卷坐标。
+ *  - 完全位于起点之后（d.y >= startY）：整体复制，新 y = d.y - startY；
+ *  - 跨越起点（d.y < startY < d.y+d.h）：裁掉起点之前部分，新瑕疵 y=0、高 = (d.y+d.h)-startY；
+ *  - 完全位于已裁段（d.y+d.h <= startY）：不带入尾料；
+ *  - 末端超过 endY 时同样截断（正常数据下瑕疵不越卷界，此处保守兜底）。
+ * 宽度/x 不变（整幅移交，布幅方向无平移）。
+ */
+function remnantDefects(sourceDefects, startY, endY, width) {
+  const out = [];
+  for (const d of sourceDefects) {
+    const top = Math.min(d.y + d.h, endY);
+    const bot = Math.max(d.y, startY);
+    if (top - bot <= 0) continue; // 与尾料区间无正高度交集：不带入
+    const x = Math.max(0, d.x);
+    const w = Math.min(d.x + d.w, width) - x;
+    if (w <= 0) continue;
+    out.push({ x, y: bot - startY, w, h: top - bot });
+  }
+  return out;
+}
+
+/** 组装一条尾料记录的对外状态（defects 为按起点重算后的目标卷瑕疵；available 时动态计算） */
+function remnantState(m, defects) {
+  return {
+    id: m.id,
+    status: m.status,                          // available=待领用 | claimed=已领用
+    label: m.label,
+    width: m.width,
+    startY: m.start_y,                        // 来源卷原始区间起点（=登记时切线）
+    endY: m.end_y,                            // 来源卷原始区间末端（=来源卷长）
+    length: m.length,                         // 尾料长度 mm
+    source: {
+      jobId: m.source_job_id,
+      jobName: m.source_job_name,
+      rollId: m.source_roll_id,
+      rollLabel: m.source_roll_label,
+      rollWidth: m.source_roll_width,
+      rollLength: m.source_roll_length,
+      cutLine: m.source_roll_cut_line,
+    },
+    target:
+      m.status === 'claimed'
+        ? {
+            jobId: m.target_job_id,
+            jobName: m.target_job_name,
+            rollId: m.target_roll_id,
+            rollLabel: m.target_roll_label,
+            claimedAt: m.claimed_at,
+          }
+        : null,
+    defectCount: defects.length,
+    defects,                                  // 重算后的瑕疵（目标卷坐标，原点=区间起点）
+    createdAt: m.created_at,
+  };
+}
+
+/** 组装与某方案相关的尾料：out=本方案登记（出库），in=领入本方案（含其重算瑕疵即新卷瑕疵） */
+function remnantsForJob(full) {
+  const { rolls, defects, remnants } = full;
+  const rollById = new Map(rolls.map((r) => [r.id, r]));
+  const out = [];
+  const incoming = [];
+  for (const m of remnants) {
+    if (m.source_job_id === full.job.id) {
+      // 出库尾料：瑕疵按来源卷当前瑕疵动态重算（登记后来源卷冻结，瑕疵不会再变）
+      const srcDefects = defects.filter((d) => d.roll_id === m.source_roll_id);
+      out.push(remnantState(m, remnantDefects(srcDefects, m.start_y, m.end_y, m.width)));
+    }
+    if (m.status === 'claimed' && m.target_job_id === full.job.id) {
+      // 领入尾料：其重算瑕疵已作为目标卷瑕疵落库，直接读取该卷瑕疵（两者一致）
+      const tr = rollById.get(m.target_roll_id);
+      const trDefects = tr ? defects.filter((d) => d.roll_id === tr.id) : [];
+      incoming.push(remnantState(m, trDefects.map((d) => ({ x: d.x, y: d.y, w: d.w, h: d.h }))));
+    }
+  }
+  return { outgoing: out, incoming };
 }
 
 // ---------- 路由 ----------
@@ -295,9 +396,12 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
       label: r.label,
       W: r.width,
       L: r.length,
-      // 已裁段视为全幅障碍矩形：未裁件不得进入 [0, cutLine)
+      // 已裁段视为全幅障碍矩形：未裁件不得进入 [0, cutLine)；
+      // 已登记尾料移交的卷，切线之后的整幅尾料区间 [cutLine,length) 同样冻结为障碍，
+      // 故未裁件不可能再排入该卷（登记后来源卷不得再排入裁片）。
       defects: [
         ...(r.cut_line > 0 ? [{ x: 0, y: 0, w: r.width, h: r.cut_line }] : []),
+        ...(r.sealed ? [{ x: 0, y: r.cut_line, w: r.width, h: r.length - r.cut_line }] : []),
         ...defects.filter((d) => d.roll_id === r.id),
       ],
     })),
@@ -336,10 +440,13 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
   const augmentReason = (pid, reason) => {
     const p = placeById.get(pid);
     if (!p || p.required_roll_id == null) return reason;
+    const reqRoll = rolls[rollIndexById.get(p.required_roll_id)];
     const cutLine = cutLineByRollId.get(p.required_roll_id) || 0;
+    if (reqRoll && reqRoll.sealed) {
+      return `${reason}；该卷尾料已登记移交并冻结，不能再排入任何裁片`;
+    }
     if (cutLine <= 0) return reason;
-    const r = rolls[rollIndexById.get(p.required_roll_id)];
-    return `${reason}；该卷切线 ${cutLine}mm 之前已裁，未裁件只能排在切线之后（剩余可用长度 ${r.length - cutLine}mm）`;
+    return `${reason}；该卷切线 ${cutLine}mm 之前已裁，未裁件只能排在切线之后（剩余可用长度 ${reqRoll.length - cutLine}mm）`;
   };
   const upd = db.prepare(
     'UPDATE placements SET roll_id = ?, x = ?, y = ?, rotation = ?, placed = 1, unplaced_reason = NULL WHERE id = ?'
@@ -425,6 +532,16 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
     }
   }
   if (!targetRoll) return res.status(400).json({ error: '无法确定目标卷' });
+
+  // ---- 尾料已登记移交的卷已冻结：不得再排入任何裁片 ----
+  if (targetRoll.sealed) {
+    return res.status(409).json({
+      error:
+        `卷「${targetRoll.label}」的尾料已登记移交（区间 ${targetRoll.cut_line}~${targetRoll.length}mm）并冻结，` +
+        `不能再排入裁片，也不能推进切线，已保留原方案`,
+      conflicts: [`卷「${targetRoll.label}」尾料区间 [${targetRoll.cut_line}, ${targetRoll.length}mm) 已登记移交`],
+    });
+  }
 
   // ---- 必用卷约束 ----
   if (placement.required_roll_id != null && placement.required_roll_id !== targetRoll.id) {
@@ -586,6 +703,14 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
           `（${target.width}×${target.length}mm），必用卷约束不可能满足，已拒绝`,
       });
     }
+    // 目标卷尾料已登记移交并冻结：必用卷约束不可能再满足
+    if (target.sealed) {
+      return res.status(400).json({
+        error:
+          `${label}的必用卷「${target.label}」尾料已登记移交并冻结，不能再排入任何裁片，` +
+          `必用卷约束不可能满足，已拒绝`,
+      });
+    }
     // 该卷已有切线时，未裁件只能使用切线之后的剩余段
     const remain = target.length - (target.cut_line || 0);
     if (placement.rv_bh > remain) {
@@ -721,25 +846,29 @@ app.post('/api/jobs/:id/piece-types/:tid/revisions', (req, res) => {
   }
 
   // ---- 前置可行性：有未裁件时至少一卷剩余段容得下；各必用卷也须容得下 ----
+  // 尾料已登记移交的卷已冻结，未裁件不可能再排入，不参与可行性。
   if (uncutSurvivors.length > 0) {
-    const anyRollFits = rolls.some((r) => newW <= r.width && newH <= r.length - (r.cut_line || 0));
+    const usableRolls = rolls.filter((r) => !r.sealed);
+    const anyRollFits = usableRolls.some((r) => newW <= r.width && newH <= r.length - (r.cut_line || 0));
     if (!anyRollFits) {
       return res.status(400).json({
         error:
           `改版后新外接尺寸 ${newW}×${newH}mm 无法放入任何一卷的切线后剩余段` +
-          `（至少需要一卷剩余段容纳该尺寸），已保留原方案`,
-        details: rolls.map((r) => `卷「${r.label}」${r.width}×${r.length - (r.cut_line || 0)}mm（切线 ${r.cut_line || 0}mm 后）`),
+          `（至少需要一卷剩余段容纳该尺寸；尾料已登记移交的卷不可再排入），已保留原方案`,
+        details: rolls.map((r) =>
+          `卷「${r.label}」${r.width}×${r.length - (r.cut_line || 0)}mm（切线 ${r.cut_line || 0}mm 后${r.sealed ? '，尾料已冻结' : ''}）`
+        ),
       });
     }
     // 各必用卷：同型号未裁件若有必用卷约束，该卷剩余段必须容得下
     const reqRollIds = [...new Set(uncutSurvivors.map((p) => p.required_roll_id).filter((v) => v != null))];
     for (const rid of reqRollIds) {
       const r = rollById.get(rid);
-      if (!r || newW > r.width || newH > r.length - (r.cut_line || 0)) {
+      if (!r || r.sealed || newW > r.width || newH > r.length - (r.cut_line || 0)) {
         return res.status(400).json({
           error:
             `改版后新外接尺寸 ${newW}×${newH}mm 超过必用卷「${r ? r.label : rid}」切线后剩余段` +
-            `（${r ? r.width + '×' + (r.length - (r.cut_line || 0)) : '卷不存在'}mm），必用卷约束不可能满足，已保留原方案`,
+            `（${r ? (r.sealed ? '该卷尾料已登记移交并冻结' : r.width + '×' + (r.length - (r.cut_line || 0)) + 'mm') : '卷不存在'}），必用卷约束不可能满足，已保留原方案`,
         });
       }
     }
@@ -919,6 +1048,13 @@ app.post('/api/jobs/:id/cuts', (req, res) => {
   if (!Number.isInteger(cutLine)) {
     return res.status(400).json({ error: '切线必须为整数毫米（字段 cutLine，单位 mm）' });
   }
+  if (roll.sealed) {
+    return res.status(409).json({
+      error:
+        `卷「${roll.label}」的尾料（切线 ${roll.cut_line}mm 之后整幅区间）已登记移交并冻结，` +
+        `不能再推进切线，也不能再排入裁片，原方案不变`,
+    });
+  }
   if (cutLine <= roll.cut_line) {
     return res.status(409).json({
       error:
@@ -1053,12 +1189,13 @@ app.post('/api/jobs/:id/cuts', (req, res) => {
 // ---------- 裁剪交接单（不可改快照；按卷与确认顺序查询，网页可查看并打印） ----------
 
 /** 组装一张交接单（含明细快照；明细按写入顺序即 y、placement id 排列） */
-function batchState(row, rollLabel) {
+function batchState(row, rollLabel, roll) {
   const items = db.prepare('SELECT * FROM cut_batch_items WHERE batch_id = ? ORDER BY id').all(row.id);
   return {
     id: row.id,
     rollId: row.roll_id,
     rollLabel,
+    sourceRemnantId: roll ? roll.source_remnant_id : null, // 裁剪卷若为领入尾料，带来源尾料 id（可追溯）
     seq: row.seq,                          // 该卷第几张交接单（确认顺序）
     previousCutLine: row.prev_cut_line,    // 本次切线前位置
     cutLine: row.cut_line,                 // 本次切线后位置
@@ -1130,7 +1267,10 @@ app.get('/api/jobs/:id/cut-batches', (req, res) => {
 
   res.json({
     job: { id: job.id, name: job.name },
-    batches: rows.map((row) => batchState(row, rollById.get(row.roll_id).label)),
+    batches: rows.map((row) => {
+      const rr = rollById.get(row.roll_id);
+      return batchState(row, rr.label, rr);
+    }),
     legacyCutPieces,
   });
 });
@@ -1147,8 +1287,345 @@ app.get('/api/jobs/:id/cut-batches/:bid', (req, res) => {
   const roll = full.rolls.find((r) => r.id === row.roll_id);
   res.json({
     job: { id: full.job.id, name: full.job.name },
-    batch: batchState(row, roll ? roll.label : String(row.roll_id)),
+    batch: batchState(row, roll ? roll.label : String(row.roll_id), roll || null),
   });
+});
+
+// ---------- 尾料移交（登记整幅尾料区间；跨方案领用一次） ----------
+
+/** 解析某方案中的卷：body.rollId 省略时单卷方案=唯一卷；失败时返回 {fail:{status,body}} */
+function resolveRollForWrite(req, rolls, multiRequiredVerb) {
+  const rollById = new Map(rolls.map((r) => [r.id, r]));
+  const bodyRollId = req.body ? req.body.rollId : undefined;
+  if (bodyRollId === undefined || bodyRollId === null) {
+    if (rolls.length === 1) return { roll: rolls[0] };
+    return {
+      fail: {
+        status: 400,
+        body: {
+          error: `该方案有 ${rolls.length} 卷，${multiRequiredVerb}必须指定卷 rollId（可用卷：${rolls
+            .map((r) => `${r.id}=${r.label}`)
+            .join('、')}）`,
+        },
+      },
+    };
+  }
+  if (!Number.isInteger(bodyRollId)) {
+    return {
+      fail: {
+        status: 400,
+        body: { error: `卷号无效：rollId 必须为卷 id 整数（收到 "${bodyRollId}"）` },
+      },
+    };
+  }
+  const roll = rollById.get(bodyRollId);
+  if (!roll) {
+    return {
+      fail: {
+        status: 400,
+        body: {
+          error: `卷不存在：方案中没有 rollId=${bodyRollId} 的卷（可用卷：${rolls
+            .map((r) => `${r.id}=${r.label}`)
+            .join('、')}）`,
+        },
+      },
+    };
+  }
+  return { roll };
+}
+
+/**
+ * 登记整幅尾料区间（尾料移交第一步）。
+ *   POST /api/jobs/:id/remnants   body: { rollId?, label? }
+ * 条件（任一不满足返回 400/409 并保持原状态）：
+ *  - 来源卷已有确认切线（cutLine > 0）；
+ *  - 切线之后没有未裁的已排入件；
+ *  - 切线之后剩余长度 > 0（cutLine < length）；
+ *  - 该卷未登记过尾料（每卷只能登记一次），且未处于冻结状态。
+ * 成功：冻结来源卷（sealed=1），写入尾料记录（区间 [cutLine,length)），来源卷此后不得再排入裁片或推进切线。
+ */
+app.post('/api/jobs/:id/remnants', (req, res) => {
+  const jobId = Number(req.params.id);
+  const full = loadFull(jobId);
+  if (!full) return res.status(404).json({ error: '方案不存在' });
+  const { rolls, defects, placements } = full;
+
+  const resolved = resolveRollForWrite(req, rolls, '登记尾料');
+  if (resolved.fail) return res.status(resolved.fail.status).json(resolved.fail.body);
+  const roll = resolved.roll;
+
+  if (roll.sealed) {
+    return res.status(409).json({
+      error:
+        `卷「${roll.label}」已登记过尾料移交（区间 ${roll.cut_line}~${roll.length}mm），` +
+        `同一卷尾料只能登记、移交一次，原方案不变`,
+    });
+  }
+  if (roll.cut_line <= 0) {
+    return res.status(409).json({
+      error:
+        `卷「${roll.label}」尚未确认过切线（切线为 0）：尾料登记要求来源卷已有确认切线，` +
+        `请先确认切线再登记整幅尾料区间，原方案不变`,
+    });
+  }
+  const remaining = roll.length - roll.cut_line;
+  if (remaining <= 0) {
+    return res.status(409).json({
+      error:
+        `卷「${roll.label}」切线 ${roll.cut_line}mm 已到卷末端（卷长 ${roll.length}mm），` +
+        `切线后剩余长度为 0，没有可移交的尾料，原方案不变`,
+    });
+  }
+  // 切线之后不得有未裁的已排入件（已裁件都在切线之前）
+  const uncutAfter = placements.filter(
+    (p) => p.placed && !p.cut && p.roll_id === roll.id && p.y + p.rv_bh > roll.cut_line
+  );
+  if (uncutAfter.length > 0) {
+    return res.status(409).json({
+      error:
+        `卷「${roll.label}」切线 ${roll.cut_line}mm 之后还有 ${uncutAfter.length} 件未裁的已排入裁片，` +
+        `不能登记整幅尾料（应先裁剪或移走这些裁片），原方案不变`,
+      conflicts: uncutAfter
+        .sort((a, b) => a.y - b.y || a.id - b.id)
+        .map((p) => `裁片「${p.name}#${p.seq}」（y ${p.y}~${p.y + p.rv_bh}mm）`),
+    });
+  }
+
+  // label：尾料说明，可省略；默认「来源卷号 尾料（cutLine~lengthmm）」
+  let label = req.body && typeof req.body.label === 'string' ? req.body.label.trim() : '';
+  if (!label) label = `${roll.label} 尾料（${roll.cut_line}~${roll.length}mm）`;
+  label = label.slice(0, 100);
+
+  // 跨起点截断/重算后的瑕疵（登记时定格个数；瑕疵本体随来源卷冻结不再变化）
+  const transformed = remnantDefects(
+    defects.filter((d) => d.roll_id === roll.id),
+    roll.cut_line,
+    roll.length,
+    roll.width
+  );
+
+  const tx = db.transaction(() => {
+    const cur = db.prepare('SELECT cut_line, sealed FROM rolls WHERE id = ?').get(roll.id);
+    if (!cur) {
+      const e = new Error('roll gone');
+      e.code = 'REMNANT_CONFLICT';
+      throw e;
+    }
+    if (cur.sealed) {
+      const e = new Error('remnant already registered');
+      e.code = 'REMNANT_CONFLICT';
+      throw e;
+    }
+    // 冻结来源卷；UNIQUE(source_roll_id) 兜底重复登记
+    db.prepare('UPDATE rolls SET sealed = 1 WHERE id = ?').run(roll.id);
+    const info = db
+      .prepare(
+        `INSERT INTO remnants
+           (source_job_id, source_roll_id, status, label, width, start_y, end_y, length, defect_count)
+         VALUES (?, ?, 'available', ?, ?, ?, ?, ?, ?)`
+      )
+      .run(jobId, roll.id, label, roll.width, roll.cut_line, roll.length, remaining, transformed.length);
+    return info.lastInsertRowid;
+  });
+  let remnantId;
+  try {
+    remnantId = tx();
+  } catch (e) {
+    if (e && /UNIQUE/i.test(String(e.message || ''))) {
+      return res.status(409).json({ error: `卷「${roll.label}」已登记过尾料移交，不能重复登记，原方案不变` });
+    }
+    throw e;
+  }
+
+  const state = jobState(jobId);
+  state.remnant = state.remnants.outgoing.find((m) => m.id === remnantId) || null;
+  res.status(201).json(state);
+});
+
+/** 组装 remnants 表行的对外状态（含动态重算瑕疵）；m 需带 join 字段 */
+function remnantRowState(m) {
+  const srcDefects = db
+    .prepare('SELECT x, y, w, h FROM defects WHERE roll_id = ? ORDER BY id')
+    .all(m.source_roll_id);
+  const transformed = remnantDefects(srcDefects, m.start_y, m.end_y, m.width);
+  return remnantState(m, transformed);
+}
+
+const remnantJoinSql = `
+  SELECT m.*, r.label AS source_roll_label, r.width AS source_roll_width,
+         r.length AS source_roll_length, r.cut_line AS source_roll_cut_line,
+         j.name AS source_job_name,
+         tj.name AS target_job_name,
+         tr.label AS target_roll_label
+  FROM remnants m
+  JOIN rolls r ON r.id = m.source_roll_id
+  JOIN jobs j ON j.id = m.source_job_id
+  LEFT JOIN jobs tj ON tj.id = m.target_job_id
+  LEFT JOIN rolls tr ON tr.id = m.target_roll_id
+`;
+
+/**
+ * 浏览尾料（跨方案领用前查看）。
+ *   GET /api/remnants                  全部尾料（按登记时间倒序）
+ *   GET /api/remnants?status=available 仅待领用
+ *   GET /api/remnants?status=claimed   仅已领用（追溯来源方案/卷/原始区间）
+ * 每条含来源方案、来源卷、原始区间与按起点重算后的瑕疵。
+ */
+app.get('/api/remnants', (req, res) => {
+  let where = '';
+  const params = [];
+  const st = req.query.status;
+  if (st !== undefined) {
+    if (st !== 'available' && st !== 'claimed') {
+      return res.status(400).json({ error: 'status 仅支持 available 或 claimed' });
+    }
+    where = 'WHERE m.status = ?';
+    params.push(st);
+  }
+  const rows = db.prepare(`${remnantJoinSql} ${where} ORDER BY m.id DESC`).all(...params);
+  res.json({ remnants: rows.map(remnantRowState) });
+});
+
+/** 单条尾料详情（领用前核查/追溯） */
+app.get('/api/remnants/:rid', (req, res) => {
+  const rid = Number(req.params.rid);
+  if (!Number.isInteger(rid)) return res.status(400).json({ error: '尾料 id 必须为整数' });
+  const m = db.prepare(`${remnantJoinSql} WHERE m.id = ?`).get(rid);
+  if (!m) return res.status(404).json({ error: '尾料不存在（可能已随来源方案删除）' });
+  res.json({ remnant: remnantRowState(m) });
+});
+
+/**
+ * 领用尾料到目标方案（尾料移交第二步；只能跨方案领用一次）。
+ *   POST /api/remnants/:rid/claim   body: { targetJobId, label? }
+ * 规则（任一不满足返回 400/404/409，两方案均不产生部分变更）：
+ *  - 尾料存在且状态为 available；已领用/重复/并发领用 → 409 冲突；
+ *  - 目标方案存在且不是来源方案；
+ *  - 领用后目标方案卷数不超过上限（50）；目标方案内卷号唯一（label 重名 → 409）。
+ * 成功（单事务）：尾料置 claimed；目标方案新增一卷（宽=尾料宽、长=尾料长，cutLine=0，未冻结），
+ * 瑕疵以尾料区间起点为零重算后复制到新卷（跨起点的瑕疵裁截到起点）；新卷带 sourceRemnantId 可追溯。
+ */
+app.post('/api/remnants/:rid/claim', (req, res) => {
+  const rid = Number(req.params.rid);
+  if (!Number.isInteger(rid)) return res.status(400).json({ error: '尾料 id 必须为整数' });
+
+  const body = req.body || {};
+  const targetJobId = Number(body.targetJobId);
+  if (!Number.isInteger(targetJobId)) {
+    return res.status(400).json({ error: 'targetJobId 必须为目标方案 id 整数' });
+  }
+  const targetJob = db.prepare('SELECT * FROM jobs WHERE id = ?').get(targetJobId);
+  if (!targetJob) return res.status(404).json({ error: `目标方案不存在：没有 id=${targetJobId} 的方案` });
+
+  let label = typeof body.label === 'string' && body.label.trim() ? body.label.trim().slice(0, 50) : '';
+
+  const tx = db.transaction(() => {
+    // 事务内重读 + 条件 UPDATE：并发领用只有一个能把 available 改成 claimed
+    const m = db.prepare('SELECT * FROM remnants WHERE id = ?').get(rid);
+    if (!m) {
+      const e = new Error('remnant not found');
+      e.code = 'REMNANT_NOT_FOUND';
+      throw e;
+    }
+    if (m.status !== 'available') {
+      const e = new Error('remnant already claimed');
+      e.code = 'REMNANT_CONFLICT';
+      throw e;
+    }
+    if (m.source_job_id === targetJobId) {
+      const e = new Error('cannot claim own remnant');
+      e.code = 'REMNANT_SAME_JOB';
+      throw e;
+    }
+    const targetRolls = db.prepare('SELECT * FROM rolls WHERE job_id = ? ORDER BY seq').all(targetJobId);
+    if (targetRolls.length >= LIMITS.maxRolls) {
+      const e = new Error('too many rolls');
+      e.code = 'REMNANT_TOO_MANY_ROLLS';
+      throw e;
+    }
+    // 默认卷号：尾料#登记id；显式卷号在目标方案内必须唯一
+    if (!label) label = `尾料#${m.id}`;
+    if (targetRolls.some((r) => r.label === label)) {
+      const e = new Error('duplicate label');
+      e.code = 'REMNANT_LABEL_DUP';
+      e.label = label;
+      throw e;
+    }
+
+    // 条件更新：仅当仍为 available 时生效（并发下失败者 changes=0）
+    const claimAt = db.prepare("SELECT datetime('now') AS t").get().t;
+    const info = db
+      .prepare("UPDATE remnants SET status = 'claimed', target_job_id = ?, claimed_at = ? WHERE id = ? AND status = 'available'")
+      .run(targetJobId, claimAt, rid);
+    if (info.changes !== 1) {
+      const e = new Error('remnant claimed concurrently');
+      e.code = 'REMNANT_CONFLICT';
+      throw e;
+    }
+
+    // 新增独立卷：整幅尾料宽度、长度=区间长度，未裁剪、未冻结，作为目标方案普通卷参与移动/优化/后续裁剪
+    const seq = targetRolls.length + 1;
+    const rollInfo = db
+      .prepare(
+        'INSERT INTO rolls (job_id, seq, label, width, length, used, used_length, cut_line, sealed, source_remnant_id) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?)'
+      )
+      .run(targetJobId, seq, label, m.width, m.length, rid);
+    const newRollId = rollInfo.lastInsertRowid;
+
+    // 瑕疵以区间起点为零重算（跨起点裁截），复制到新卷
+    const srcDefects = db
+      .prepare('SELECT x, y, w, h FROM defects WHERE roll_id = ? ORDER BY id')
+      .all(m.source_roll_id);
+    const transformed = remnantDefects(srcDefects, m.start_y, m.end_y, m.width);
+    const insD = db.prepare('INSERT INTO defects (job_id, roll_id, x, y, w, h) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const d of transformed) insD.run(targetJobId, newRollId, d.x, d.y, d.w, d.h);
+
+    db.prepare('UPDATE remnants SET target_roll_id = ?, defect_count = ? WHERE id = ?').run(
+      newRollId,
+      transformed.length,
+      rid
+    );
+    return { newRollId, seq, defectCount: transformed.length };
+  });
+
+  let result;
+  try {
+    result = tx();
+  } catch (e) {
+    if (!e) throw e;
+    if (e.code === 'REMNANT_NOT_FOUND') {
+      return res.status(404).json({ error: '尾料不存在（可能已随来源方案删除）' });
+    }
+    if (e.code === 'REMNANT_SAME_JOB') {
+      return res.status(400).json({ error: '尾料只能跨方案领用：目标方案与来源方案相同，不能领回本方案' });
+    }
+    if (e.code === 'REMNANT_TOO_MANY_ROLLS') {
+      return res.status(409).json({ error: `目标方案卷数已达上限（${LIMITS.maxRolls} 卷），不能再领入尾料，两方案均未变更` });
+    }
+    if (e.code === 'REMNANT_LABEL_DUP') {
+      return res.status(409).json({ error: `目标方案中已存在卷号「${e.label}」，卷号必须唯一，请换用其他 label，两方案均未变更` });
+    }
+    if (e.code === 'REMNANT_CONFLICT') {
+      return res.status(409).json({
+        error: `尾料 #${rid} 已被领用（或正被另一请求领用）：尾料只能跨方案领用一次，本次操作已整体回滚，两方案均不产生部分变更`,
+      });
+    }
+    throw e;
+  }
+
+  const state = jobState(targetJobId);
+  const newRoll = state.rolls.find((r) => r.id === result.newRollId);
+  state.claim = {
+    remnantId: rid,
+    targetJobId,
+    rollId: result.newRollId,
+    seq: result.seq,
+    label: newRoll.label,
+    width: newRoll.width,
+    length: newRoll.length,
+    defectCount: result.defectCount,
+  };
+  res.status(201).json(state);
 });
 
 // ---------- 错误处理与启动 ----------

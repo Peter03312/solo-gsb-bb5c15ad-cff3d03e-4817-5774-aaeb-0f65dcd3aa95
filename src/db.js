@@ -22,6 +22,27 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 尾料移交：来源卷满足“已有确认切线、切线后无未裁排入件、剩余长度 > 0”时登记一条整幅尾料区间。
+-- 登记即冻结来源卷（rolls.sealed=1）；领用（claim）只能发生一次：UNIQUE(source_roll_id)
+-- 与事务内条件 UPDATE status 共同防止重复/并发领用。可追溯来源方案、来源卷与原始区间。
+CREATE TABLE IF NOT EXISTS remnants (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_job_id  INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,  -- 来源方案
+  source_roll_id INTEGER NOT NULL REFERENCES rolls(id) ON DELETE CASCADE, -- 来源卷
+  status        TEXT NOT NULL DEFAULT 'available', -- available=待领用 | claimed=已领用（只允许领用一次）
+  label         TEXT NOT NULL,                     -- 尾料名称/说明（登记时定格）
+  width         INTEGER NOT NULL,                  -- 整幅尾料布幅宽 mm（=来源卷宽）
+  start_y       INTEGER NOT NULL,                  -- 原始区间起点 mm（=登记时来源卷切线 cut_line）
+  end_y         INTEGER NOT NULL,                  -- 原始区间末端 mm（=来源卷 length）
+  length        INTEGER NOT NULL,                  -- 尾料长度 end_y-start_y mm（>0）
+  defect_count  INTEGER NOT NULL DEFAULT 0,        -- 领用时将带入目标卷的瑕疵数（跨起点截断/重算后）
+  target_job_id  INTEGER REFERENCES jobs(id) ON DELETE SET NULL,  -- 领用方目标方案（claimed 后非空）
+  target_roll_id INTEGER REFERENCES rolls(id) ON DELETE SET NULL, -- 领用生成的独立卷（claimed 后非空）
+  claimed_at    TEXT,                              -- 领用时间
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (source_roll_id)                          -- 同一来源卷尾料只能登记/移交一次
+);
+
 CREATE TABLE IF NOT EXISTS rolls (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -31,7 +52,9 @@ CREATE TABLE IF NOT EXISTS rolls (
   length      INTEGER NOT NULL,    -- 该卷可用长度 mm
   used        INTEGER NOT NULL DEFAULT 0,        -- 是否有裁片排入（启用）
   used_length INTEGER NOT NULL DEFAULT 0,        -- 该卷实际占用长度
-  cut_line    INTEGER NOT NULL DEFAULT 0         -- 本卷裁剪切线（mm）：[0,cut_line) 段已裁，不可回退；只增不减
+  cut_line    INTEGER NOT NULL DEFAULT 0,        -- 本卷裁剪切线（mm）：[0,cut_line) 段已裁，不可回退；只增不减
+  sealed      INTEGER NOT NULL DEFAULT 0,        -- 尾料已登记移交：1=整幅尾料区间 [cut_line,length) 已冻结，不得再排入裁片或推进切线
+  source_remnant_id INTEGER REFERENCES remnants(id) ON DELETE SET NULL -- 非 NULL=本卷由其他方案尾料领用来（追溯来源）
 );
 
 CREATE TABLE IF NOT EXISTS defects (
@@ -124,6 +147,9 @@ CREATE INDEX IF NOT EXISTS idx_cut_batches_job  ON cut_batches(job_id);
 CREATE INDEX IF NOT EXISTS idx_cut_batches_roll ON cut_batches(roll_id);
 CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON cut_batch_items(batch_id);
 CREATE INDEX IF NOT EXISTS idx_batch_items_job   ON cut_batch_items(job_id);
+CREATE INDEX IF NOT EXISTS idx_remnants_status   ON remnants(status);
+CREATE INDEX IF NOT EXISTS idx_remnants_source_job ON remnants(source_job_id);
+CREATE INDEX IF NOT EXISTS idx_remnants_target_job ON remnants(target_job_id);
 `);
 }
 
@@ -150,6 +176,12 @@ if (!hasColumn('placements', 'cut')) {
 }
 if (!hasColumn('rolls', 'cut_line')) {
   db.exec('ALTER TABLE rolls ADD COLUMN cut_line INTEGER NOT NULL DEFAULT 0');
+}
+if (!hasColumn('rolls', 'sealed')) {
+  db.exec('ALTER TABLE rolls ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0');
+}
+if (!hasColumn('rolls', 'source_remnant_id')) {
+  db.exec('ALTER TABLE rolls ADD COLUMN source_remnant_id INTEGER');
 }
 if (!hasColumn('piece_types', 'current_rev')) {
   db.exec('ALTER TABLE piece_types ADD COLUMN current_rev INTEGER NOT NULL DEFAULT 1');

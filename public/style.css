@@ -143,3 +143,24 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   display: inline-block; margin: 2px 4px 0 0; padding: 1px 8px;
   background: #fff; border: 1px solid #c8a415; border-radius: 10px; font-size: 12px;
 }
+
+/* 尾料移交面板 */
+#remnantPanel { display: none; margin: 6px 12px 0; padding: 8px 12px; background: #e0f2f1; border: 1px solid #80cbc4; border-radius: 6px; }
+#remnantPanel.show { display: block; }
+#remnantPanel .rm-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; color: #004d40; margin-bottom: 4px; }
+#remnantPanel .rm-head b { font-size: 13px; white-space: nowrap; }
+#remnantPanel > div:not(.rm-head) { margin-top: 6px; padding: 6px 8px; border-radius: 4px; font-size: 12.5px; }
+#remnantPanel .rm-inbound { background: #ffffff; border: 1px solid #80cbc4; }
+#remnantPanel .rm-outbound { background: #eceff1; border: 1px solid #b0bec5; color: #37474f; }
+#remnantPanel .rm-avail { background: #f1f8e9; border: 1px solid #aed581; }
+#remnantPanel .rm-unavail { background: #fff8e1; border: 1px solid #e0c97f; color: #6d4c00; }
+#remnantPanel .rm-unavail-list { background: #fff; border: 1px dashed #d7b658; }
+#remnantPanel .rm-item { padding: 4px 0 4px 14px; line-height: 1.7; border-bottom: 1px dashed #cfd8dc; }
+#remnantPanel .rm-item:last-child { border-bottom: none; }
+#remnantPanel .rm-tag { font-weight: 600; color: #00695c; margin-right: 4px; }
+#remnantPanel .rm-outbound .rm-tag, #remnantPanel .rm-unavail .rm-tag { color: #5d4037; }
+#remnantPanel .rm-reason { color: #b71c1c; }
+#remnantPanel .rm-label { display: inline-flex; align-items: center; gap: 4px; margin: 0 8px; color: #555; }
+#remnantPanel .rm-label input { width: 170px; padding: 3px 6px; }
+#remnantPanel button.primary { background: #00897b; border-color: #00897b; padding: 2px 10px; }
+#remnantPanel button.primary:hover { background: #00695c; }

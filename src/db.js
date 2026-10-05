@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS rolls (
   length      INTEGER NOT NULL,    -- 该卷可用长度 mm
   used        INTEGER NOT NULL DEFAULT 0,        -- 是否有裁片排入（启用）
   used_length INTEGER NOT NULL DEFAULT 0,        -- 该卷实际占用长度
-  cut_line    INTEGER NOT NULL DEFAULT 0         -- 本卷裁剪切线（mm）：[0,cut_line) 段已裁，不可回退；只增不减
+  cut_line    INTEGER NOT NULL DEFAULT 0,        -- 本卷裁剪切线（mm）：[0,cut_line) 段已裁，不可回退；只增不减
+  is_remnant  INTEGER NOT NULL DEFAULT 0,        -- 尾料卷标记：由其他方案移交的整幅尾料段（作为本方案独立卷参与排样）
+  remnant_transfer_id INTEGER REFERENCES remnant_transfers(id) ON DELETE SET NULL, -- 尾料卷：对应移交台账；来源卷：指向其移交记录
+  remnant_frozen INTEGER NOT NULL DEFAULT 0      -- 来源卷尾料已移交：封卷，不得再排入裁片或推进切线
 );
 
 CREATE TABLE IF NOT EXISTS defects (
@@ -108,6 +111,23 @@ CREATE TABLE IF NOT EXISTS cut_batch_items (
   x INTEGER NOT NULL, y INTEGER NOT NULL,   -- 卷内坐标（定格）
   rotation     INTEGER NOT NULL          -- 方向 0|180（定格）
 );
+
+-- 尾料移交台账：来源卷切线后整幅尾料段跨方案领用到目标方案，成为目标方案的独立卷。
+-- 登记与领用在同一事务原子完成；source_roll_id 上的 UNIQUE 保证同一尾料只能跨方案领用一次
+-- （重复/并发领用必有一方失败，两方案均不产生部分变更）。此后来源卷封卷、不得再排入或推进切线。
+CREATE TABLE IF NOT EXISTS remnant_transfers (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_job_id   INTEGER REFERENCES jobs(id) ON DELETE SET NULL,   -- 来源方案（删除方案后保留台账，置空可追溯字段）
+  target_job_id   INTEGER REFERENCES jobs(id) ON DELETE SET NULL,   -- 目标方案
+  source_roll_id  INTEGER UNIQUE REFERENCES rolls(id) ON DELETE SET NULL, -- 来源卷（唯一：尾料只能领用一次）
+  target_roll_id  INTEGER REFERENCES rolls(id) ON DELETE SET NULL,  -- 领入后在目标方案生成的独立卷
+  source_job_name TEXT NOT NULL,     -- 定格：来源方案名（来源方案删除后仍可追溯）
+  source_roll_label TEXT NOT NULL,   -- 定格：来源卷号
+  width  INTEGER NOT NULL,           -- 移交尾料布幅宽度（=来源卷布幅，mm）
+  from_y INTEGER NOT NULL,           -- 尾料区间起点（=领用时来源卷切线，mm）；目标卷坐标以该起点为零
+  length INTEGER NOT NULL,           -- 尾料长度 = 来源卷 length - from_y（mm，>0）
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
 // 索引放在列迁移之后创建（旧库的 defects/placements 此时可能还没有 roll_id 列）
@@ -124,6 +144,8 @@ CREATE INDEX IF NOT EXISTS idx_cut_batches_job  ON cut_batches(job_id);
 CREATE INDEX IF NOT EXISTS idx_cut_batches_roll ON cut_batches(roll_id);
 CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON cut_batch_items(batch_id);
 CREATE INDEX IF NOT EXISTS idx_batch_items_job   ON cut_batch_items(job_id);
+CREATE INDEX IF NOT EXISTS idx_remnant_target_job ON remnant_transfers(target_job_id);
+CREATE INDEX IF NOT EXISTS idx_remnant_source_job ON remnant_transfers(source_job_id);
 `);
 }
 
@@ -156,6 +178,15 @@ if (!hasColumn('piece_types', 'current_rev')) {
 }
 if (!hasColumn('placements', 'piece_revision_id')) {
   db.exec('ALTER TABLE placements ADD COLUMN piece_revision_id INTEGER');
+}
+if (!hasColumn('rolls', 'is_remnant')) {
+  db.exec('ALTER TABLE rolls ADD COLUMN is_remnant INTEGER NOT NULL DEFAULT 0');
+}
+if (!hasColumn('rolls', 'remnant_transfer_id')) {
+  db.exec('ALTER TABLE rolls ADD COLUMN remnant_transfer_id INTEGER');
+}
+if (!hasColumn('rolls', 'remnant_frozen')) {
+  db.exec('ALTER TABLE rolls ADD COLUMN remnant_frozen INTEGER NOT NULL DEFAULT 0');
 }
 
 // 旧库迁移：为每个已有型号补一条“第 1 版”纸样，并把全部已存在件挂到该版

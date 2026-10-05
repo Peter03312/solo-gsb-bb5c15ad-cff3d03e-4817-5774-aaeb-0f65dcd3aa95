@@ -17,6 +17,8 @@ let pieceRows = [];        // 新建表单：裁片卡片
 let cutInputRollId = null; // 切线输入框当前对应的卷（切换卷时重置建议值）
 let batchesData = null;    // 裁剪交接单（GET /api/jobs/:id/cut-batches 返回）
 const openBatches = new Set(); // 交接单面板中已展开明细的单号
+let remnantData = null;    // 尾料总览（GET /api/remnants 返回）
+const openRemnantUnavail = new Set(); // 尾料面板中展开的“不可领用原因”卷
 
 const PALETTE = [
   '#f4a261', '#2a9d8f', '#e9c46a', '#8ab17d', '#577590',
@@ -91,6 +93,7 @@ async function openJob(id) {
   selectedId = null;
   cutInputRollId = null;
   openBatches.clear();
+  openRemnantUnavail.clear();
   if (!state.rolls.some((r) => r.id === currentRollId)) {
     currentRollId = state.rolls.length ? state.rolls[0].id : null;
   }
@@ -98,6 +101,7 @@ async function openJob(id) {
   fitScale();
   renderAll();
   refreshBatches();
+  refreshRemnants();
 }
 
 function currentRoll() {
@@ -127,6 +131,7 @@ function renderAll() {
   renderCutBar();
   renderCutPanel();
   renderBatchPanel();
+  renderRemnantPanel();
   renderUnplaced();
   renderSelPanel();
   renderRevPanel();
@@ -169,13 +174,23 @@ function renderRollTabs() {
   for (const r of state.rolls) {
     const tab = document.createElement('button');
     tab.className = 'rolltab' + (r.id === currentRollId ? ' active' : '');
+    const mark = r.remnantFrozen
+      ? '🧊'
+      : r.remnant
+        ? '♻'
+        : '';
+    let status;
+    if (r.remnantFrozen) {
+      status = `<span class="ulen">🧊尾料已移交·封卷（切线 ${r.cutLine}mm）</span>`;
+    } else if (r.cutLine > 0) {
+      status = `<span class="ulen">✂切线 ${r.cutLine}mm · 已裁 ${r.cutCount} 件${r.remnant ? ' · ♻尾料' : ''}</span>`;
+    } else if (r.used) {
+      status = `<span class="ulen">占用 ${r.usedLength}mm${r.remnant ? ' · ♻尾料' : ''}</span>`;
+    } else {
+      status = `<span class="idle">${r.remnant ? '尾料卷·未启用' : '未启用'}</span>`;
+    }
     tab.innerHTML =
-      `${r.seq}. ${r.label} <span class="dim">${r.width}×${r.length}mm</span>` +
-      (r.cutLine > 0
-        ? `<span class="ulen">✂切线 ${r.cutLine}mm · 已裁 ${r.cutCount} 件</span>`
-        : r.used
-          ? `<span class="ulen">占用 ${r.usedLength}mm</span>`
-          : '<span class="idle">未启用</span>');
+      `${mark}${r.seq}. ${r.label} <span class="dim">${r.width}×${r.length}mm</span>` + status;
     tab.onclick = () => {
       currentRollId = r.id;
       fitScale();
@@ -194,11 +209,16 @@ function renderCutBar() {
   const r = currentRoll();
   if (!r) return;
   const info = $('cutInfo');
-  if (r.cutLine > 0) {
+  if (r.remnantFrozen) {
+    info.innerHTML = `卷「${r.label}」<b>尾料已移交其他方案，已封卷</b>：切线 ${r.cutLine}/${r.length}mm 定格，不得再排入裁片或推进切线`;
+  } else if (r.cutLine > 0) {
     info.textContent = `卷「${r.label}」：切线 ${r.cutLine}/${r.length}mm，已裁 ${r.cutCount} 件，剩余 ${r.length - r.cutLine}mm`;
   } else {
     info.textContent = `卷「${r.label}」尚未裁剪（卷长 ${r.length}mm）`;
   }
+  // 封卷卷不得推进切线：禁用输入与确认按钮
+  $('cutLineInput').disabled = !!r.remnantFrozen;
+  $('btnConfirmCut').disabled = !!r.remnantFrozen;
   const input = $('cutLineInput');
   if (cutInputRollId !== r.id) {
     cutInputRollId = r.id;
@@ -334,6 +354,177 @@ function renderBatchPanel() {
       renderBatchPanel();
     };
   });
+}
+
+/* ================= 尾料移交（切线后整幅尾料跨方案领用为独立卷） ================= */
+
+async function refreshRemnants() {
+  if (!state) {
+    remnantData = null;
+    renderRemnantPanel();
+    return;
+  }
+  try {
+    remnantData = await api('GET', `/api/remnants?targetJobId=${state.job.id}`);
+  } catch (err) {
+    remnantData = null;
+  }
+  renderRemnantPanel();
+}
+
+function remnantDefectText(defs) {
+  if (!defs || defs.length === 0) return '无瑕疵';
+  return defs
+    .map((d) => `(${d.x},${d.y}) ${d.w}×${d.h}mm${d.cutAtStart ? '（跨起点已裁截）' : ''}`)
+    .join('；');
+}
+
+function renderRemnantPanel() {
+  const el = $('remnantPanel');
+  if (!state || !remnantData) {
+    el.className = '';
+    el.innerHTML = '';
+    return;
+  }
+  const { available, unavailable, transferred } = remnantData;
+  // 与当前方案相关的移交：领入（inbound）或本方案领出的卷（按 target/source id 分）
+  const inbound = (state.transfers || []).filter((t) => t.direction === 'inbound');
+  const outbound = (state.transfers || []).filter((t) => t.direction === 'outbound');
+  if (available.length === 0 && unavailable.length === 0 && inbound.length === 0 && outbound.length === 0) {
+    el.className = '';
+    el.innerHTML = '';
+    return;
+  }
+  el.className = 'show';
+  el.innerHTML =
+    '<div class="rm-head"><b>♻ 尾料移交（切线后整幅剩余布段跨方案领用）</b>' +
+    '<span class="hint">来源卷切线后无未裁排入件且剩余长度 &gt; 0 即可领用；领入后作为本方案独立卷参与移动、优化与裁剪。</span></div>';
+
+  // ---- 本方案已领入的尾料卷（可追溯来源方案/卷/原始区间） ----
+  if (inbound.length > 0) {
+    const box = document.createElement('div');
+    box.className = 'rm-inbound';
+    box.innerHTML = '<b>本方案已领入尾料卷：</b>';
+    for (const t of inbound) {
+      const row = document.createElement('div');
+      row.className = 'rm-item';
+      const targetRoll = state.rolls.find((r) => r.id === t.targetRollId);
+      row.innerHTML =
+        `<span class="rm-tag">卷「${targetRoll ? targetRoll.label : '#' + t.targetRollId}」</span>` +
+        `来源方案 #${t.sourceJobId == null ? '（已删除）' : t.sourceJobId} ${t.sourceJobName} 的卷「${t.sourceRollLabel}」` +
+        `原始区间 [${t.fromY}, ${t.fromY + t.length})mm（布幅 ${t.width}mm，尾料长 ${t.length}mm，以 ${t.fromY}mm 为零点重算）` +
+        `，移交时间 ${t.createdAt}` +
+        (targetRoll ? ` <button class="mini rm-goto" data-rid="${targetRoll.id}">查看卷</button>` : '');
+      row.querySelector('.rm-goto') &&
+        (row.querySelector('.rm-goto').onclick = () => {
+          currentRollId = t.targetRollId;
+          fitScale();
+          renderAll();
+        });
+      box.appendChild(row);
+    }
+    el.appendChild(box);
+  }
+
+  // ---- 本方案已领出（封卷）的卷 ----
+  if (outbound.length > 0) {
+    const box = document.createElement('div');
+    box.className = 'rm-outbound';
+    box.innerHTML = '<b>本方案已移交尾料（来源卷已封卷，不得再排入或推进切线）：</b>';
+    for (const t of outbound) {
+      const row = document.createElement('div');
+      row.className = 'rm-item';
+      row.innerHTML =
+        `卷「${t.sourceRollLabel}」[${t.fromY}, ${t.fromY + t.length})mm（${t.width}×${t.length}mm）` +
+        ` → 目标方案 #${t.targetJobId}，移交时间 ${t.createdAt}`;
+      box.appendChild(row);
+    }
+    el.appendChild(box);
+  }
+
+  // ---- 可领用尾料（其他方案） ----
+  if (available.length > 0) {
+    const box = document.createElement('div');
+    box.className = 'rm-avail';
+    box.innerHTML = '<b>可领用尾料：</b>';
+    for (const a of available) {
+      const row = document.createElement('div');
+      row.className = 'rm-item';
+      row.innerHTML =
+        `<span class="rm-tag">来源 #${a.sourceJobId} ${a.sourceJobName} / 卷「${a.sourceRollLabel}」</span>` +
+        `布幅 ${a.width}mm，切线 ${a.cutLine}mm，尾料 <b>${a.length}mm</b>；瑕疵：${remnantDefectText(a.defects)}` +
+        `<label class="rm-label">领入卷号 <input type="text" class="rm-inlabel" value="${a.suggestedLabel}" maxlength="50"></label>` +
+        `<button class="mini primary rm-claim" data-rid="${a.sourceRollId}">领用到本方案</button>`;
+      box.appendChild(row);
+    }
+    el.appendChild(box);
+    el.querySelectorAll('.rm-claim').forEach((btn) => {
+      btn.onclick = async () => {
+        const sourceRollId = Number(btn.dataset.rid);
+        const labelInput = btn.parentElement.querySelector('.rm-inlabel');
+        const label = labelInput.value.trim();
+        const a = available.find((x) => x.sourceRollId === sourceRollId);
+        if (!window.confirm(
+          `确认把来源方案 #${a.sourceJobId} 卷「${a.sourceRollLabel}」切线 ${a.cutLine}mm 之后的整幅尾料（${a.length}mm）领用到本方案？\n` +
+          `· 领入后成为本方案独立卷「${label}」，瑕疵坐标以 ${a.cutLine}mm 为零点重算（跨起点瑕疵裁截）；\n` +
+          `· 来源卷随即封卷，不得再排入裁片或推进切线；\n` +
+          `· 尾料只能跨方案领用一次，重复/并发领用将冲突，双方均无部分变更。`
+        )) return;
+        try {
+          const resp = await api('POST', `/api/jobs/${state.job.id}/remnant-claims`, {
+            sourceRollId, label: label || undefined,
+          });
+          const c = resp.remnantClaim;
+          state = resp;
+          delete state.remnantClaim;
+          const cutN = c.defects.filter((d) => d.cutAtStart).length;
+          showMsg(
+            `尾料已领入：独立卷「${c.targetRollLabel}」（${c.width}×${c.length}mm，第 ${c.targetRollSeq} 卷）` +
+            `，${c.defects.length} 个瑕疵随尾料（${cutN} 个跨起点已裁截）；来源卷已封卷` +
+            (c.releasedRequiredPieceIds.length
+              ? `；来源方案 ${c.releasedRequiredPieceIds.length} 件未裁件的该卷必用约束已释放`
+              : '') + '。',
+            false
+          );
+          renderAll();
+          refreshRemnants();
+        } catch (err) {
+          showApiError(err, '尾料领用被拒绝，双方保持原状态');
+          refreshRemnants();
+        }
+      };
+    });
+  }
+
+  // ---- 暂不可领用（其他方案有切线但条件不满足的卷） ----
+  if (unavailable.length > 0) {
+    const box = document.createElement('div');
+    box.className = 'rm-unavail';
+    const opened = openRemnantUnavail.size > 0;
+    box.innerHTML =
+      `<button class="mini rm-unavail-toggle">${opened ? '收起' : '查看'}</button> ` +
+      `<b>暂不可领用的裁剪卷（${unavailable.length}）：</b><span class="hint">已确认切线但不满足尾料领用条件。</span>`;
+    el.appendChild(box);
+    if (opened) {
+      const list = document.createElement('div');
+      list.className = 'rm-unavail-list';
+      for (const u of unavailable) {
+        const row = document.createElement('div');
+        row.className = 'rm-item';
+        row.innerHTML =
+          `<span class="rm-tag">来源 #${u.sourceJobId} ${u.sourceJobName} / 卷「${u.sourceRollLabel}」</span>` +
+          `布幅 ${u.width}mm，切线 ${u.cutLine}mm，剩余 ${u.remaining}mm —— <span class="rm-reason">${u.reason}</span>` +
+          (u.blocking.length ? '<br><span class="hint">' + u.blocking.join('；') + '</span>' : '');
+        list.appendChild(row);
+      }
+      el.appendChild(list);
+    }
+    el.querySelector('.rm-unavail-toggle').onclick = () => {
+      if (openRemnantUnavail.size > 0) openRemnantUnavail.clear();
+      else unavailable.forEach((u) => openRemnantUnavail.add(u.sourceRollId));
+      renderRemnantPanel();
+    };
+  }
 }
 
 function renderUnplaced() {
@@ -546,7 +737,10 @@ function draw() {
   ctx.fillStyle = '#777';
   ctx.font = '12px sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText(`卷 ${r.seq}：${r.label}（${W}×${L}mm）`, mmX(0), mmY(0) - 10);
+  ctx.fillText(
+    `卷 ${r.seq}：${r.label}（${W}×${L}mm）${r.remnant ? '　♻ 尾料移交卷' : ''}${r.remnantFrozen ? '　🧊 尾料已移交·封卷' : ''}`,
+    mmX(0), mmY(0) - 10
+  );
 
   // 网格与标尺
   const step = scale * 100 >= 8 ? 100 : scale * 500 >= 8 ? 500 : 1000;
@@ -659,6 +853,33 @@ function draw() {
     ctx.fillStyle = '#2e7d32';
     ctx.font = '11px sans-serif';
     ctx.fillText(`本卷占用 ${r.usedLength}mm`, mmX(4), mmY(r.usedLength) - 4);
+  }
+
+  // 封卷卷：切线后尾料已移交，叠加冰封覆盖层（最先在已裁阴影之后已绘；这里在顶层加斜纹提示）
+  if (r.remnantFrozen) {
+    ctx.fillStyle = 'rgba(84,110,122,0.18)';
+    ctx.fillRect(mmX(0), mmY(r.cutLine || 0), W * scale, (L - (r.cutLine || 0)) * scale);
+    ctx.strokeStyle = 'rgba(55,71,79,0.55)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([10, 6]);
+    ctx.strokeRect(mmX(2), mmY(r.cutLine || 0) + 2, W * scale - 4, (L - (r.cutLine || 0)) * scale - 4);
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#37474f';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText('🧊 尾料已移交·封卷（不得再排入裁片或推进切线）', mmX(8), mmY(Math.min(L, (r.cutLine || 0) + 200)));
+  }
+
+  // 尾料卷：标注来源方案/卷/原始区间（以起点为零点）
+  if (r.remnant && Array.isArray(state.transfers)) {
+    const t = state.transfers.find((x) => x.targetRollId === r.id);
+    if (t) {
+      ctx.fillStyle = '#006064';
+      ctx.font = '11px sans-serif';
+      ctx.fillText(
+        `♻ 尾料：来源方案 #${t.sourceJobId == null ? '（已删除）' : t.sourceJobId} ${t.sourceJobName} / 卷「${t.sourceRollLabel}」 原始 [${t.fromY},${t.fromY + t.length})mm，零点=${t.fromY}mm`,
+        mmX(4), mmY(L) - 6
+      );
+    }
   }
 }
 
@@ -818,6 +1039,7 @@ $('btnConfirmCut').onclick = async () => {
     cutInputRollId = null;
     renderAll();
     refreshBatches();
+    refreshRemnants();
   } catch (err) {
     showApiError(err, '裁剪确认被拒绝，原方案不变');
     renderAll();
@@ -900,7 +1122,9 @@ $('btnDeleteJob').onclick = async () => {
   selectedId = null;
   currentRollId = null;
   batchesData = null;
+  remnantData = null;
   openBatches.clear();
+  openRemnantUnavail.clear();
   await refreshJobList();
   renderAll();
   setupCanvas();
